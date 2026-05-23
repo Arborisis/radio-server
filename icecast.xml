@@ -23,8 +23,7 @@
     <hostname>0.0.0.0</hostname>
     
     <listen-socket>
-        <port>8000</port>
-        <!-- Utiliser ${PORT} pour Railway -->
+        <port>${PORT}</port>
     </listen-socket>
     
     <fileserve>1</fileserve>
