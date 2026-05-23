@@ -1,27 +1,27 @@
-FROM debian:bullseye-slim
+FROM node:20-slim
 
-# Install dependencies
+# Install ffmpeg pour le streaming
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    icecast2 \
-    liquidsoap \
+    ffmpeg \
     curl \
-    jq \
     && rm -rf /var/lib/apt/lists/*
 
-# Create directories
-RUN mkdir -p /var/log/icecast2 /etc/icecast2 /etc/liquidsoap /var/lib/liquidsoap/music
+# Create app directory
+WORKDIR /app
 
-# Copy configs
-COPY icecast.xml /etc/icecast2/icecast.xml
-COPY liquidsoap.liq /etc/liquidsoap/radio.liq
-COPY start.sh /start.sh
-RUN chmod +x /start.sh
+# Copy package files
+COPY package*.json ./
+RUN npm ci --omit=dev
 
-# Expose ports
+# Copy app
+COPY server.js ./
+COPY public/ ./public/
+
+# Expose port
 EXPOSE 8000
 
 # Healthcheck
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -fs http://localhost:8000/status-json.xsl > /dev/null || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -fs http://localhost:${PORT:-8000}/health > /dev/null || exit 1
 
-CMD ["/start.sh"]
+CMD ["node", "server.js"]

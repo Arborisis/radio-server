@@ -1,0 +1,16 @@
+{
+  "name": "arborisis-radio-server",
+  "version": "1.0.0",
+  "description": "Radio streaming server for Arborisis",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19",
+    "node-http-server": "^14.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
