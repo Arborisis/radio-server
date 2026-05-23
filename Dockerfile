@@ -4,7 +4,6 @@ FROM debian:bullseye-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     icecast2 \
     liquidsoap \
-    liquidsoap-plugin-all \
     curl \
     jq \
     && rm -rf /var/lib/apt/lists/*
