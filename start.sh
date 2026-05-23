@@ -11,10 +11,6 @@ sed -i "s/\${ICECAST_SOURCE_PASSWORD:-source}/$ICECAST_SOURCE_PASSWORD/g" /etc/i
 sed -i "s/\${ICECAST_RELAY_PASSWORD:-relay}/$ICECAST_RELAY_PASSWORD/g" /etc/icecast2/icecast.xml
 sed -i "s/\${ICECAST_ADMIN_PASSWORD:-admin}/$ICECAST_ADMIN_PASSWORD/g" /etc/icecast2/icecast.xml
 
-# Modifier la config pour permettre le run en root
-sed -i 's/<changeowner>/<!--<changeowner>/g' /etc/icecast2/icecast.xml
-sed -i 's/<\/changeowner>/<\/changeowner>-->/g' /etc/icecast2/icecast.xml
-
 # Démarrer Icecast en arrière-plan
 echo "[Radio] Démarrage Icecast..."
 icecast2 -c /etc/icecast2/icecast.xml &

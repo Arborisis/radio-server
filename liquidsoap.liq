@@ -8,7 +8,7 @@ set("log.level", 3)
 # Port et mount
 port = 8000
 mount = "/arborisis.mp3"
-crossfade_duration = 4
+crossfade_duration = 4.0
 
 # Playlist par défaut (silence si vide)
 default_playlist = playlist.safe("/var/lib/liquidsoap/music/default.m3u", reload=3600)

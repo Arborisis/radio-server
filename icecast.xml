@@ -46,6 +46,10 @@
     
     <security>
         <chroot>0</chroot>
+        <changeowner>
+            <user>root</user>
+            <group>root</group>
+        </changeowner>
     </security>
     
     <!-- Mount point pour la radio Arborisis -->
