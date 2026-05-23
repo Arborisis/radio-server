@@ -5,24 +5,21 @@ set("init.daemon", false)
 set("log.stdout", true)
 set("log.level", 3)
 
-# Port pour le stream sortant
+# Port et mount
 port = 8000
-mount = getenv("RADIO_MOUNT", "/arborisis.mp3")
-crossfade_duration = int_of_float(getenv("RADIO_CROSSFADE", "4"))
+mount = "/arborisis.mp3"
+crossfade_duration = 4
 
-# Playlist par défaut (silence si aucune musique)
+# Playlist par défaut (silence si vide)
 default_playlist = playlist.safe("/var/lib/liquidsoap/music/default.m3u", reload=3600)
 
-# Stream d'entrée depuis Laravel (live DJ)
-live = input.http("http://localhost:8000/live.ogg")
-
-# Fallback : Live > Playlist > Silence
-radio = fallback(track_sensitive=false, [live, default_playlist, blank(duration=2.)])
+# Fallback
+radio = fallback(track_sensitive=false, [default_playlist, blank(duration=2.)])
 
 # Crossfade
 radio = crossfade(duration=crossfade_duration, radio)
 
-# Normalisation du volume
+# Normalisation
 radio = normalize(radio)
 
 # Output vers Icecast
@@ -30,7 +27,7 @@ output.icecast(
     %mp3(bitrate=128, samplerate=44100),
     host="localhost",
     port=port,
-    password=getenv("ICECAST_SOURCE_PASSWORD", "source"),
+    password="source123",
     mount=mount,
     name="Arborisis Radio",
     description="Radio nature et sons de la forêt",
@@ -39,12 +36,12 @@ output.icecast(
     radio
 )
 
-# Output fallback (fichier silence)
+# Output fallback
 output.icecast(
     %mp3(bitrate=128, samplerate=44100),
     host="localhost",
     port=port,
-    password=getenv("ICECAST_SOURCE_PASSWORD", "source"),
+    password="source123",
     mount="/fallback.mp3",
     name="Arborisis Radio Fallback",
     description="Fallback stream",
