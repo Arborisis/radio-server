@@ -26,7 +26,7 @@ EXPOSE 8000
 USER icecast
 
 # Healthcheck
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries-3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -fs http://localhost:8000/status-json.xsl > /dev/null || exit 1
 
 CMD ["/start.sh"]
