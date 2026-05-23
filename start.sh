@@ -11,6 +11,10 @@ sed -i "s/\${ICECAST_SOURCE_PASSWORD:-source}/$ICECAST_SOURCE_PASSWORD/g" /etc/i
 sed -i "s/\${ICECAST_RELAY_PASSWORD:-relay}/$ICECAST_RELAY_PASSWORD/g" /etc/icecast2/icecast.xml
 sed -i "s/\${ICECAST_ADMIN_PASSWORD:-admin}/$ICECAST_ADMIN_PASSWORD/g" /etc/icecast2/icecast.xml
 
+# Modifier la config pour permettre le run en root
+sed -i 's/<changeowner>/<!--<changeowner>/g' /etc/icecast2/icecast.xml
+sed -i 's/<\/changeowner>/<\/changeowner>-->/g' /etc/icecast2/icecast.xml
+
 # Démarrer Icecast en arrière-plan
 echo "[Radio] Démarrage Icecast..."
 icecast2 -c /etc/icecast2/icecast.xml &
@@ -25,16 +29,16 @@ if ! curl -s http://localhost:8000/status-json.xsl > /dev/null 2>&1; then
     sleep 5
 fi
 
-# Démarrer Liquidsoap
-echo "[Radio] Démarrage Liquidsoap..."
-liquidsoap /etc/liquidsoap/radio.liq &
-LIQPid=$!
-
 # Créer un fichier de playlist par défaut si vide
 mkdir -p /var/lib/liquidsoap/music
 if [ ! -f /var/lib/liquidsoap/music/default.m3u ]; then
     echo "# Default playlist - Add music files here" > /var/lib/liquidsoap/music/default.m3u
 fi
+
+# Démarrer Liquidsoap
+echo "[Radio] Démarrage Liquidsoap..."
+liquidsoap /etc/liquidsoap/radio.liq &
+LIQPid=$!
 
 echo "[Radio] Serveur démarré !"
 echo "[Radio] Stream: http://localhost:8000${RADIO_MOUNT:-/arborisis.mp3}"
