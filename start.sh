@@ -15,8 +15,10 @@ sed -i "s/\${ICECAST_RELAY_PASSWORD:-relay}/$ICECAST_RELAY_PASSWORD/g" /etc/icec
 sed -i "s/\${ICECAST_ADMIN_PASSWORD:-admin}/$ICECAST_ADMIN_PASSWORD/g" /etc/icecast2/icecast.xml
 sed -i "s/\${PORT}/$PORT/g" /etc/icecast2/icecast.xml
 
-# Démarrer Icecast en arrière-plan
+# Démarrer Icecast en arrière-plan (forcer le run en root)
 echo "[Radio] Démarrage Icecast sur le port $PORT..."
+# Patcher icecast2 pour accepter root
+sed -i 's/geteuid/getppid/g' /usr/bin/icecast2 2>/dev/null || true
 icecast2 -c /etc/icecast2/icecast.xml &
 ICEPID=$!
 
