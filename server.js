@@ -127,6 +127,7 @@ class RadioBroadcaster {
     this.listeners = new Set();
     this.icyListeners = new Set();
     this.isRunning = false;
+    this.strikes = new WeakMap(); // Track slow listeners
   }
 
   addListener(res, icy = false) {
@@ -191,14 +192,35 @@ class RadioBroadcaster {
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 
         // Broadcast audio data to all active listeners
+        // Drop slow listeners (backpressure) to prevent memory explosion
+        const toRemove = [];
         for (const listener of this.listeners) {
-          if (!listener.destroyed) {
-            try {
-              listener.write(buffer);
-            } catch (err) {
-              // Ignore write errors for disconnected clients
-            }
+          if (listener.destroyed) {
+            toRemove.push(listener);
+            continue;
           }
+          const canWrite = listener.writableNeedDrain === false || listener.writableNeedDrain === undefined;
+          if (!canWrite) {
+            // Listener is overwhelmed, increment strike
+            const strikes = (this.strikes.get(listener) || 0) + 1;
+            this.strikes.set(listener, strikes);
+            if (strikes >= 5) {
+              console.log(`[Radio] Dropping slow listener after ${strikes} strikes`);
+              toRemove.push(listener);
+              try { listener.end(); } catch (_) {}
+            }
+            continue;
+          }
+          this.strikes.set(listener, 0);
+          try {
+            listener.write(buffer);
+          } catch (err) {
+            toRemove.push(listener);
+          }
+        }
+        for (const listener of toRemove) {
+          this.removeListener(listener);
+          listeners--;
         }
 
         // Inject ICY metadata for listeners that requested it
@@ -209,7 +231,9 @@ class RadioBroadcaster {
             for (const listener of this.icyListeners) {
               if (!listener.destroyed) {
                 try {
-                  listener.write(meta);
+                  if (listener.writableNeedDrain === false || listener.writableNeedDrain === undefined) {
+                    listener.write(meta);
+                  }
                 } catch (err) {
                   // Ignore write errors
                 }
