@@ -1,7 +1,6 @@
 const express = require('express');
 const { S3Client, ListObjectsV2Command, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
-const { Readable } = require('stream');
 const http = require('http');
 const https = require('https');
 
@@ -15,7 +14,7 @@ const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || process.env.RAI
 const R2_BUCKET = process.env.R2_BUCKET || process.env.RAILWAY_R2_BUCKET || 'arborisis';
 const R2_REGION = process.env.R2_DEFAULT_REGION || process.env.RAILWAY_R2_DEFAULT_REGION || 'auto';
 const R2_PREFIX = process.env.R2_PREFIX || '';
-const R2_FILTER_PATTERN = process.env.R2_FILTER_PATTERN || '.mp3'; // ex: '_radio.mp3' pour filtrer les traités
+const R2_FILTER_PATTERN = process.env.R2_FILTER_PATTERN || '.mp3';
 const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL_MS || '60000', 10);
 const ICY_METAINT = parseInt(process.env.ICY_METAINT || '8192', 10);
 
@@ -39,7 +38,7 @@ const s3 = new S3Client({
 });
 
 // ── State ─────────────────────────────────────────────────────────────────
-let playlist = [];       // Array of { key, size, lastModified }
+let playlist = [];
 let currentTrackIndex = 0;
 let isScanning = false;
 let listeners = 0;
@@ -94,10 +93,8 @@ async function scanR2() {
       continuationToken = response.NextContinuationToken;
     } while (continuationToken);
 
-    // Sort by last modified (newest first) or shuffle if configured
     const shuffle = process.env.RADIO_SHUFFLE === 'true';
     if (shuffle) {
-      // Deterministic shuffle based on date
       const seed = new Date().toISOString().split('T')[0];
       mp3Keys.sort((a, b) => {
         const hashA = require('crypto').createHash('md5').update(seed + a.key).digest('hex');
@@ -121,26 +118,34 @@ async function scanR2() {
   }
 }
 
-// ── Radio Broadcaster (single S3 stream → all listeners) ──────────────────
+// ── Radio Broadcaster (load track to memory, broadcast at constant bitrate) ─
 class RadioBroadcaster {
   constructor() {
     this.listeners = new Set();
     this.icyListeners = new Set();
     this.isRunning = false;
-    this.strikes = new WeakMap(); // Track slow listeners
+    this.intervalId = null;
+    this.currentBuffer = null;
+    this.currentOffset = 0;
   }
 
   addListener(res, icy = false) {
     this.listeners.add(res);
     if (icy) this.icyListeners.add(res);
+    listeners++;
+    console.log(`[Radio] Listener connected. Total: ${listeners}`);
     if (!this.isRunning) {
       this.start();
     }
   }
 
   removeListener(res) {
-    this.listeners.delete(res);
-    this.icyListeners.delete(res);
+    if (this.listeners.has(res)) {
+      this.listeners.delete(res);
+      this.icyListeners.delete(res);
+      listeners--;
+      console.log(`[Radio] Listener disconnected. Total: ${listeners}`);
+    }
   }
 
   async start() {
@@ -155,7 +160,7 @@ class RadioBroadcaster {
       }
 
       const track = playlist[currentTrackIndex];
-      await this.streamTrack(track);
+      await this.loadAndStreamTrack(track);
       currentTrackIndex = (currentTrackIndex + 1) % playlist.length;
     }
 
@@ -163,7 +168,7 @@ class RadioBroadcaster {
     console.log('[Radio] Broadcaster stopped');
   }
 
-  async streamTrack(track) {
+  async loadAndStreamTrack(track) {
     try {
       const cmd = new GetObjectCommand({
         Bucket: R2_BUCKET,
@@ -177,79 +182,88 @@ class RadioBroadcaster {
         return;
       }
 
-      const title = track.key.split('/').pop().replace(/\.mp3$/i, '').replace(/[_-]/g, ' ');
-      const artist = 'Arborisis';
+      // Load entire small MP3 into memory (typically ~2-3MB)
+      const chunks = [];
+      for await (const chunk of s3res.Body) {
+        chunks.push(chunk);
+      }
+      this.currentBuffer = Buffer.concat(chunks);
+      this.currentOffset = 0;
 
-      const stream = s3res.Body;
-      const reader = stream instanceof Readable ? stream : Readable.from(stream);
+      const title = track.key.split('/').pop().replace(/\.mp3$/i, '').replace(/[_-]/g, ' ');
+      console.log(`[Radio] Loaded track: ${title} (${this.currentBuffer.length} bytes)`);
+
+      await this.streamBuffer(title);
+
+    } catch (err) {
+      console.error(`[Radio] Error loading track ${track.key}:`, err.message);
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+
+  streamBuffer(title) {
+    return new Promise((resolve) => {
+      const chunkSize = 8192;
+      const bitrate = 128 * 1024 / 8; // 128 kbps = 16384 bytes/sec
+      const intervalMs = Math.round((chunkSize / bitrate) * 1000); // ~500ms
 
       let bytesSinceMeta = 0;
-      const hasIcy = this.icyListeners.size > 0;
 
-      for await (const chunk of reader) {
-        if (this.listeners.size === 0) break;
+      this.intervalId = setInterval(() => {
+        if (this.listeners.size === 0) {
+          clearInterval(this.intervalId);
+          resolve();
+          return;
+        }
 
-        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        const end = Math.min(this.currentOffset + chunkSize, this.currentBuffer.length);
+        const chunk = this.currentBuffer.slice(this.currentOffset, end);
 
-        // Broadcast audio data to all active listeners
-        // Drop slow listeners (backpressure) to prevent memory explosion
-        const toRemove = [];
-        for (const listener of this.listeners) {
-          if (listener.destroyed) {
-            toRemove.push(listener);
-            continue;
-          }
-          const canWrite = listener.writableNeedDrain === false || listener.writableNeedDrain === undefined;
-          if (!canWrite) {
-            // Listener is overwhelmed, increment strike
-            const strikes = (this.strikes.get(listener) || 0) + 1;
-            this.strikes.set(listener, strikes);
-            if (strikes >= 5) {
-              console.log(`[Radio] Dropping slow listener after ${strikes} strikes`);
-              toRemove.push(listener);
-              try { listener.end(); } catch (_) {}
-            }
-            continue;
-          }
-          this.strikes.set(listener, 0);
-          try {
-            listener.write(buffer);
-          } catch (err) {
-            toRemove.push(listener);
+        if (chunk.length === 0) {
+          clearInterval(this.intervalId);
+          console.log(`[Radio] Finished track: ${title}`);
+          resolve();
+          return;
+        }
+
+        // Remove destroyed listeners
+        for (const listener of Array.from(this.listeners)) {
+          if (listener.destroyed || listener.finished || listener.writableEnded) {
+            this.removeListener(listener);
           }
         }
-        for (const listener of toRemove) {
-          this.removeListener(listener);
-          listeners--;
+
+        // Broadcast audio chunk to all active listeners
+        for (const listener of this.listeners) {
+          try {
+            listener.write(chunk);
+          } catch (err) {
+            this.removeListener(listener);
+          }
         }
 
         // Inject ICY metadata for listeners that requested it
-        if (hasIcy) {
-          bytesSinceMeta += buffer.length;
+        if (this.icyListeners.size > 0) {
+          bytesSinceMeta += chunk.length;
           if (bytesSinceMeta >= ICY_METAINT) {
-            const meta = generateIcyMetadata(title, artist);
+            const meta = generateIcyMetadata(title, 'Arborisis');
             for (const listener of this.icyListeners) {
-              if (!listener.destroyed) {
+              if (!listener.destroyed && !listener.finished) {
                 try {
-                  if (listener.writableNeedDrain === false || listener.writableNeedDrain === undefined) {
-                    listener.write(meta);
-                  }
+                  listener.write(meta);
                 } catch (err) {
-                  // Ignore write errors
+                  this.removeListener(listener);
                 }
               }
             }
             bytesSinceMeta = 0;
           }
         }
-      }
 
-      console.log(`[Radio] Finished track: ${title}`);
-    } catch (err) {
-      console.error(`[Radio] Broadcast error for ${track.key}:`, err.message);
-      // Wait briefly to avoid tight error loops
-      await new Promise(r => setTimeout(r, 1000));
-    }
+        this.currentOffset = end;
+
+      }, intervalMs);
+    });
   }
 }
 
@@ -340,15 +354,10 @@ app.get('/arborisis.mp3', (req, res) => {
     res.setHeader('icy-metaint', String(ICY_METAINT));
   }
 
-  listeners++;
-  console.log(`[Radio] Listener connected. Total: ${listeners}`);
-
   broadcaster.addListener(res, icyRequested);
 
   req.on('close', () => {
     broadcaster.removeListener(res);
-    listeners--;
-    console.log(`[Radio] Listener disconnected. Total: ${listeners}`);
     if (!res.destroyed) {
       try { res.end(); } catch (_) {}
     }
