@@ -1,6 +1,9 @@
 const express = require('express');
 const { S3Client, ListObjectsV2Command, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { NodeHttpHandler } = require('@smithy/node-http-handler');
 const { Readable } = require('stream');
+const http = require('http');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -16,6 +19,10 @@ const R2_FILTER_PATTERN = process.env.R2_FILTER_PATTERN || '.mp3'; // ex: '_radi
 const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL_MS || '60000', 10);
 const ICY_METAINT = parseInt(process.env.ICY_METAINT || '8192', 10);
 
+// ── HTTP Agents (high socket limit) ───────────────────────────────────────
+const httpAgent = new http.Agent({ maxSockets: 500, keepAlive: true });
+const httpsAgent = new https.Agent({ maxSockets: 500, keepAlive: true });
+
 // ── S3 Client (Cloudflare R2) ─────────────────────────────────────────────
 const s3 = new S3Client({
   region: R2_REGION,
@@ -25,6 +32,10 @@ const s3 = new S3Client({
     secretAccessKey: R2_SECRET_ACCESS_KEY,
   },
   forcePathStyle: true,
+  requestHandler: new NodeHttpHandler({
+    httpAgent,
+    httpsAgent,
+  }),
 });
 
 // ── State ─────────────────────────────────────────────────────────────────
@@ -110,53 +121,115 @@ async function scanR2() {
   }
 }
 
-async function streamTrack(track, res, injectIcy) {
-  try {
-    const cmd = new GetObjectCommand({
-      Bucket: R2_BUCKET,
-      Key: track.key,
-    });
+// ── Radio Broadcaster (single S3 stream → all listeners) ──────────────────
+class RadioBroadcaster {
+  constructor() {
+    this.listeners = new Set();
+    this.icyListeners = new Set();
+    this.isRunning = false;
+  }
 
-    const s3res = await s3.send(cmd);
+  addListener(res, icy = false) {
+    this.listeners.add(res);
+    if (icy) this.icyListeners.add(res);
+    if (!this.isRunning) {
+      this.start();
+    }
+  }
 
-    if (!s3res.Body) {
-      console.warn(`[Radio] Empty body for ${track.key}`);
-      return 0;
+  removeListener(res) {
+    this.listeners.delete(res);
+    this.icyListeners.delete(res);
+  }
+
+  async start() {
+    this.isRunning = true;
+    console.log('[Radio] Broadcaster started');
+
+    while (this.isRunning && this.listeners.size > 0) {
+      if (playlist.length === 0) {
+        console.warn('[Radio] No tracks in playlist, waiting...');
+        await new Promise(r => setTimeout(r, 5000));
+        continue;
+      }
+
+      const track = playlist[currentTrackIndex];
+      await this.streamTrack(track);
+      currentTrackIndex = (currentTrackIndex + 1) % playlist.length;
     }
 
-    const title = track.key.split('/').pop().replace(/\.mp3$/i, '').replace(/[_-]/g, ' ');
-    const artist = 'Arborisis';
+    this.isRunning = false;
+    console.log('[Radio] Broadcaster stopped');
+  }
 
-    let totalBytes = 0;
-    let bytesSinceMeta = 0;
-    const chunkSize = 8192;
+  async streamTrack(track) {
+    try {
+      const cmd = new GetObjectCommand({
+        Bucket: R2_BUCKET,
+        Key: track.key,
+      });
 
-    const stream = s3res.Body;
-    const reader = stream instanceof Readable ? stream : Readable.from(stream);
+      const s3res = await s3.send(cmd);
 
-    for await (const chunk of reader) {
-      if (res.destroyed) break;
+      if (!s3res.Body) {
+        console.warn(`[Radio] Empty body for ${track.key}`);
+        return;
+      }
 
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      res.write(buffer);
-      totalBytes += buffer.length;
+      const title = track.key.split('/').pop().replace(/\.mp3$/i, '').replace(/[_-]/g, ' ');
+      const artist = 'Arborisis';
 
-      if (injectIcy) {
-        bytesSinceMeta += buffer.length;
-        if (bytesSinceMeta >= ICY_METAINT) {
-          res.write(generateIcyMetadata(title, artist));
-          bytesSinceMeta = 0;
+      const stream = s3res.Body;
+      const reader = stream instanceof Readable ? stream : Readable.from(stream);
+
+      let bytesSinceMeta = 0;
+      const hasIcy = this.icyListeners.size > 0;
+
+      for await (const chunk of reader) {
+        if (this.listeners.size === 0) break;
+
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+
+        // Broadcast audio data to all active listeners
+        for (const listener of this.listeners) {
+          if (!listener.destroyed) {
+            try {
+              listener.write(buffer);
+            } catch (err) {
+              // Ignore write errors for disconnected clients
+            }
+          }
+        }
+
+        // Inject ICY metadata for listeners that requested it
+        if (hasIcy) {
+          bytesSinceMeta += buffer.length;
+          if (bytesSinceMeta >= ICY_METAINT) {
+            const meta = generateIcyMetadata(title, artist);
+            for (const listener of this.icyListeners) {
+              if (!listener.destroyed) {
+                try {
+                  listener.write(meta);
+                } catch (err) {
+                  // Ignore write errors
+                }
+              }
+            }
+            bytesSinceMeta = 0;
+          }
         }
       }
-    }
 
-    console.log(`[Radio] Streamed: ${title} (${totalBytes} bytes)`);
-    return totalBytes;
-  } catch (err) {
-    console.error(`[Radio] Stream error for ${track.key}:`, err.message);
-    return 0;
+      console.log(`[Radio] Finished track: ${title}`);
+    } catch (err) {
+      console.error(`[Radio] Broadcast error for ${track.key}:`, err.message);
+      // Wait briefly to avoid tight error loops
+      await new Promise(r => setTimeout(r, 1000));
+    }
   }
 }
+
+const broadcaster = new RadioBroadcaster();
 
 // ── Health check ──────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
@@ -225,7 +298,7 @@ app.post('/rescan', (req, res) => {
 });
 
 // ── Stream principal ──────────────────────────────────────────────────────
-app.get('/arborisis.mp3', async (req, res) => {
+app.get('/arborisis.mp3', (req, res) => {
   const icyRequested = req.headers['icy-metadata'] === '1';
 
   res.setHeader('Content-Type', 'audio/mpeg');
@@ -246,28 +319,16 @@ app.get('/arborisis.mp3', async (req, res) => {
   listeners++;
   console.log(`[Radio] Listener connected. Total: ${listeners}`);
 
-  try {
-    while (!res.destroyed) {
-      if (playlist.length === 0) {
-        console.warn('[Radio] No tracks in playlist, waiting...');
-        await new Promise(r => setTimeout(r, 5000));
-        continue;
-      }
+  broadcaster.addListener(res, icyRequested);
 
-      const track = playlist[currentTrackIndex];
-      await streamTrack(track, res, icyRequested);
-
-      currentTrackIndex = (currentTrackIndex + 1) % playlist.length;
-    }
-  } catch (err) {
-    console.error('[Radio] Stream loop error:', err.message);
-  } finally {
+  req.on('close', () => {
+    broadcaster.removeListener(res);
     listeners--;
     console.log(`[Radio] Listener disconnected. Total: ${listeners}`);
     if (!res.destroyed) {
       try { res.end(); } catch (_) {}
     }
-  }
+  });
 });
 
 // ── 404 handler ───────────────────────────────────────────────────────────
